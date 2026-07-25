@@ -76,9 +76,11 @@ function parseRunApi(decoded) {
   const url = info.url || ''
   const title = (info.title || info.page_title || obj.page_title || '').trim()
   const description = info.description || info.remark || ''
+  const escHtml = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 
   let md = ''
-  if (description) md += `> ${description}\n\n`
+  // remark / 描述：用 <pre> 原样输出（保留换行与缩进，不走 Markdown 渲染），避免格式走样
+  if (description) md += `<pre class="remark">${escHtml(description)}</pre>\n\n`
   md += `**请求方法**：${method}\n\n`
   md += `**请求地址**：${url}\n\n`
   const table = (rows, label) => {
@@ -309,20 +311,54 @@ export function toMarkdown(pages, catalog) {
 export function toHtml(pages, catalog) {
   const md = toMarkdown(pages, catalog)
   const rawBody = marked.parse(md)
-  // 把「响应示例」代码块包裹为可折叠的 <details>：默认展开，点击 summary 可折叠；
-  // 数据过长（>420px）时由末尾脚本自动折叠，避免长 JSON 撑爆页面。
-  const body = rawBody.replace(
+  // 1) 把「响应示例」代码块包裹为可折叠的 <details>：默认展开，点击 summary 可折叠；
+  //    数据过长（>420px）时由末尾脚本自动折叠，避免长 JSON 撑爆页面。
+  const wrapped = rawBody.replace(
     /(<p>)?<strong>响应示例<\/strong>(<\/p>)?\s*<pre>([\s\S]*?)<\/pre>/g,
     '<details class="resp-example" open><summary>响应示例<span class="toggle-hint">（点击折叠 / 展开）</span></summary><pre>$3</pre></details>'
   )
+  // 2) 给所有标题加锚点 id，并收集生成目录 TOC（含目录层级与接口）
+  const toc = []
+  let sec = 0
+  const body = wrapped.replace(/<h([2-6])>([\s\S]*?)<\/h\1>/g, (m, level, text) => {
+    const plain = text.replace(/<[^>]+>/g, '').trim()
+    const id = 'sec-' + ++sec
+    const lvl = parseInt(level, 10)
+    if (lvl >= 2) toc.push({ level: lvl, id, text: plain })
+    return `<h${level} id="${id}">${text}</h${level}>`
+  })
+  const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  const tocHtml = toc.length
+    ? `<nav class="toc"><div class="toc-title">目录</div><input id="toc-search" class="toc-search" type="text" placeholder="搜索接口…" /><ul>${toc
+        .map((t) => `<li class="toc-l${t.level}"><a href="#${t.id}">${esc(t.text)}</a></li>`)
+        .join('')}</ul></nav>`
+    : ''
   return `<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <title>ShowDoc 接口文档</title>
 <style>
-  body{font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;max-width:900px;margin:40px auto;padding:0 20px;color:#1b2233;line-height:1.7}
+  html{scroll-behavior:smooth}
+  body{font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;color:#1b2233;line-height:1.7;margin:0}
+  .layout{display:flex;align-items:flex-start}
+  /* 左侧目录预览：吸顶、可滚动、点击跳转 */
+  .toc{position:sticky;top:0;align-self:flex-start;width:240px;max-height:100vh;overflow:auto;flex:none;border-right:1px solid #e3e8f0;padding:20px 14px;background:#fafbfe;font-size:13px}
+  .toc-title{font-weight:700;color:#2f6fed;margin-bottom:10px}
+  .toc ul{list-style:none;margin:0;padding:0}
+  .toc-search{width:100%;box-sizing:border-box;margin:0 0 12px;padding:6px 9px;border:1px solid #cdd6e6;border-radius:6px;font-size:13px;outline:none}
+  .toc-search:focus{border-color:#4f8cff}
+  .toc li{margin:1px 0}
+  .toc a{display:block;color:#3a4a63;text-decoration:none;padding:3px 8px;border-radius:5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .toc a:hover{background:#e7eefc;color:#2f6fed}
+  .toc .toc-l2{font-weight:600;color:#2f6fed}
+  .toc .toc-l3{padding-left:18px}
+  .toc .toc-l4{padding-left:34px}
+  .toc .toc-l5{padding-left:50px}
+  .toc .toc-l6{padding-left:66px}
+  .content{flex:1;min-width:0;max-width:920px;margin:40px auto;padding:0 20px}
   h1{border-bottom:2px solid #4f8cff;padding-bottom:8px}
   h2{margin-top:40px;color:#2f6fed}
   h3{margin-top:28px;color:#1b2233}
+  .content :target{background:#fff5e6;border-radius:6px;scroll-margin-top:12px}
   table{border-collapse:collapse;width:100%;margin:12px 0}
   th,td{border:1px solid #d8deea;padding:8px 10px;text-align:left}
   th{background:#eef1f7}
@@ -336,14 +372,33 @@ export function toHtml(pages, catalog) {
   details.resp-example>summary .toggle-hint{font-weight:400;font-size:12px;color:#7a8295;margin-left:6px}
   details.resp-example>pre{margin:0;border-radius:0}
   details.resp-example.auto-collapsed>summary{background:#fff5e6;color:#b26a00}
+  /* remark / 描述：原样输出，浅色可读，保留换行与缩进 */
+  pre.remark{background:#f6f8fc;border:1px solid #e3e8f0;color:#1b2233;white-space:pre-wrap;word-break:break-word;font-family:inherit}
 </style></head>
 <body>
+<div class="layout">
+${tocHtml}
+<div class="content">
 ${body}
+</div>
+</div>
 <script>
 document.querySelectorAll('details.resp-example').forEach(function(d){
   var pre=d.querySelector('pre');
   if(pre && pre.scrollHeight>420){ d.open=false; d.classList.add('auto-collapsed'); }
 });
+// 目录搜索：按接口名实时过滤
+var tocBox=document.getElementById('toc-search');
+if(tocBox){
+  tocBox.addEventListener('input',function(){
+    var q=this.value.trim().toLowerCase();
+    document.querySelectorAll('.toc li').forEach(function(li){
+      var a=li.querySelector('a');
+      var t=a?a.textContent.toLowerCase():'';
+      li.style.display=(!q||t.indexOf(q)>=0)?'':'none';
+    });
+  });
+}
 </script>
 </body></html>`
 }
