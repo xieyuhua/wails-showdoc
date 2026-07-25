@@ -1,0 +1,11 @@
+{
+  "name": "showdoc-devkit",
+  "outputfilename": "ShowDocDocExport.exe",
+  "frontend:dir": ".",
+  "frontend:install": "npm install",
+  "frontend:build": "npm run build",
+  "author": {
+    "name": "showdoc-devkit"
+  },
+  "version": "1.0.0"
+}
