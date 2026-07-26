@@ -6,3 +6,9 @@ export function GetConfig():Promise<{[key: string]: any}>;
 export function GetPages(arg1:string,arg2:string,arg3:string,arg4:Array<string>):Promise<{[key: string]: any}>;
 
 export function GetTree(arg1:string,arg2:string,arg3:string,arg4:string):Promise<{[key: string]: any}>;
+
+export function LoadConfigFile():Promise<{[key: string]: any}>;
+
+export function SaveConfig(arg1:{[key: string]: any}):Promise<void>;
+
+export function UpdatePage(arg1:string,arg2:string,arg3:string,arg4:string,arg5:string,arg6:string,arg7:string,arg8:string):Promise<{[key: string]: any}>;

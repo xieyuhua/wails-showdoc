@@ -1,6 +1,6 @@
 <script setup>
 import { reactive, ref, computed, watch } from 'vue'
-import { parsePage, toMarkdown, toHtml, toOpenApi, toPostman, download } from '../lib/exporters.js'
+import { parsePage, toMarkdown, toHtml, toOpenApi, toPostman, download, buildCatTree, groupPagesByCat } from '../lib/exporters.js'
 import { callShowdoc } from '../lib/api.js'
 
 const props = defineProps({
@@ -41,35 +41,14 @@ function toggleCollapse(catId) {
   else collapsed.add(id)
 }
 
-// 按目录层级分组展示：每个目录节点带 children，页面归入对应 cat_id
+// 按目录层级分组展示：复用 exporters 的 buildCatTree / groupPagesByCat，避免重复实现
 const grouped = computed(() => {
-  const catalog = props.tree?.catalog || []
-  const pages = props.tree?.pages || []
-
-  const byParent = new Map()
-  catalog.forEach((c) => {
-    const pid =
-      c.parent_cat_id == null || c.parent_cat_id === '' || c.parent_cat_id === 0 || c.parent_cat_id === '0'
-        ? null
-        : String(c.parent_cat_id)
-    if (!byParent.has(pid)) byParent.set(pid, [])
-    byParent.get(pid).push(c)
-  })
-  const build = (pid) =>
-    (byParent.get(pid) || []).map((c) => ({
-      ...c,
-      children: build(String(c.cat_id))
-    }))
-  const catTree = build(null)
-
+  const catTree = buildCatTree(props.tree?.catalog || [])
+  const groups = groupPagesByCat(props.tree?.pages || [])
   const pagesByCat = new Map()
-  pagesByCat.set(null, [])
-  pages.forEach((p) => {
-    const cid = p.cat_id == null || p.cat_id === '' || p.cat_id === 0 || p.cat_id === '0' ? null : String(p.cat_id)
-    if (!pagesByCat.has(cid)) pagesByCat.set(cid, [])
-    pagesByCat.get(cid).push(p)
-  })
-
+  for (const [k, v] of Object.entries(groups)) {
+    pagesByCat.set(k === 'null' ? null : k, v)
+  }
   return { catTree, pagesByCat }
 })
 

@@ -122,6 +122,18 @@ function parseRunApi(decoded) {
   }
 }
 
+// 把页面原始内容转成「可编辑」文本：若是 RunApi 的 JSON（被 HTML 转义），则解码成
+// 可读 JSON；否则原样返回（普通 Markdown）。编辑后再回传 ShowDoc 时会重新转义。
+export function decodePageContent(raw) {
+  const decoded = decodeHtml(String(raw || ''))
+  try {
+    JSON.parse(decoded)
+    return decoded
+  } catch {
+    return raw || ''
+  }
+}
+
 // 把一页 ShowDoc 内容解析成结构化对象
 export function parsePage(page) {
   const raw = page.page_content || ''
@@ -237,7 +249,7 @@ function parseParamsTable(md) {
 // ── 各格式生成 ──
 
 // 把扁平 catalog（含 parent_cat_id）构建成带 children 的层级树
-function buildCatTree(catalog) {
+export function buildCatTree(catalog) {
   const cats = catalog || []
   const byParent = new Map()
   cats.forEach((c) => {
@@ -253,7 +265,7 @@ function buildCatTree(catalog) {
 }
 
 // 页面按 cat_id 分组（null/空/0 归到 null）
-function groupPagesByCat(pages) {
+export function groupPagesByCat(pages) {
   const groups = {}
   pages.forEach((p) => {
     const cid = p.catId == null || p.catId === '' || p.catId === 0 || p.catId === '0' ? null : String(p.catId)

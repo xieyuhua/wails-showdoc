@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -28,6 +29,60 @@ func NewApp() *App {
 // GetConfig 返回默认私服地址（对应 node 的 GET /api/config）
 func (a *App) GetConfig() (map[string]interface{}, error) {
 	return map[string]interface{}{"showdocBaseUrl": a.defaultBaseURL}, nil
+}
+
+// configPath 返回本地配置文件路径（位于用户配置目录下的 ShowDocDocExport/config.json）
+func configPath() (string, error) {
+	dir, err := os.UserConfigDir()
+	if err != nil || dir == "" {
+		dir, err = os.Getwd()
+		if err != nil {
+			return "", err
+		}
+	}
+	sub := filepath.Join(dir, "ShowDocDocExport")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		return "", err
+	}
+	return filepath.Join(sub, "config.json"), nil
+}
+
+// SaveConfig 把前端配置持久化到本地配置文件（JSON）。
+// 入参为 map[string]interface{}，由前端传入 {baseUrl, apiKey, apiToken, itemId, projects}
+func (a *App) SaveConfig(cfg map[string]interface{}) error {
+	p, err := configPath()
+	if err != nil {
+		return err
+	}
+	if cfg == nil {
+		cfg = map[string]interface{}{}
+	}
+	b, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(p, b, 0o600)
+}
+
+// LoadConfigFile 从本地配置文件读取上次保存的配置；文件不存在或损坏时返回空 map
+func (a *App) LoadConfigFile() (map[string]interface{}, error) {
+	p, err := configPath()
+	if err != nil {
+		return map[string]interface{}{}, err
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return map[string]interface{}{}, nil
+		}
+		return map[string]interface{}{}, err
+	}
+	var cfg map[string]interface{}
+	if err := json.Unmarshal(b, &cfg); err != nil {
+		// 文件损坏时不报错，返回空，让前端回退到默认值
+		return map[string]interface{}{}, nil
+	}
+	return cfg, nil
 }
 
 func resolveBaseUrl(raw, def string) (string, error) {
@@ -233,4 +288,28 @@ func (a *App) GetPages(baseUrl, apiKey, apiToken string, pageIds []string) (map[
 		}
 	}
 	return map[string]interface{}{"pages": results}, nil
+}
+
+// UpdatePage 修改/更新一个接口页面内容（对应 ShowDoc 开放 API 的 item/page/edit）。
+// pageId 为空时 ShowDoc 会新建页面；catId 为空表示挂到项目根目录。
+func (a *App) UpdatePage(baseUrl, apiKey, apiToken, itemId, pageId, catId, pageTitle, pageContent string) (map[string]interface{}, error) {
+	if strings.TrimSpace(itemId) == "" {
+		return nil, fmt.Errorf("缺少 item_id（ShowDoc 项目 ID）")
+	}
+	if strings.TrimSpace(pageTitle) == "" {
+		return nil, fmt.Errorf("页面标题（page_title）不能为空")
+	}
+	data, err := a.post(baseUrl, "item/page/edit", map[string]string{
+		"api_key":      apiKey,
+		"api_token":    apiToken,
+		"item_id":      itemId,
+		"page_id":      pageId,
+		"cat_id":       catId,
+		"page_title":   pageTitle,
+		"page_content": pageContent,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return data, nil
 }

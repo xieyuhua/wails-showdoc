@@ -13,3 +13,15 @@ export function GetPages(arg1, arg2, arg3, arg4) {
 export function GetTree(arg1, arg2, arg3, arg4) {
   return window['go']['main']['App']['GetTree'](arg1, arg2, arg3, arg4);
 }
+
+export function LoadConfigFile() {
+  return window['go']['main']['App']['LoadConfigFile']();
+}
+
+export function SaveConfig(arg1) {
+  return window['go']['main']['App']['SaveConfig'](arg1);
+}
+
+export function UpdatePage(arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8) {
+  return window['go']['main']['App']['UpdatePage'](arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8);
+}

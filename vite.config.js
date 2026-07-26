@@ -13,5 +13,16 @@ export default defineConfig({
         changeOrigin: true
       }
     }
+  },
+  // preview（vite preview，默认 4173）默认不继承 server.proxy，
+  // 会导致 /api 请求无法转发到 Express 后端而返回 500。这里显式补上。
+  preview: {
+    port: 4173,
+    proxy: {
+      '/api': {
+        target: 'http://localhost:3333',
+        changeOrigin: true
+      }
+    }
   }
 })

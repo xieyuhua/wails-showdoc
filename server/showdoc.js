@@ -6,8 +6,8 @@ import { config } from './config.js'
 // ShowDoc 私服对接
 //
 // 使用 ShowDoc 开放 API（https://www.showdoc.com.cn/help/1380919648553536）
-//   - 读取项目接口树：/api/item/info  （部分私服版本也支持 /api/item/show）
-//   - 保存/更新接口文档：/api/item/updateApiItem
+//   - 读取项目接口树：/api/item/info
+//   - 保存/更新接口文档：/api/item/page/edit（新版）→ 回退 item/updateByApi（老版通用）
 //   - 新建目录：/api/item/insertCatalog
 //
 // 所有凭证（api_key / api_token / 私服地址）可由前端临时传入，
@@ -70,18 +70,17 @@ async function post(baseUrl, path, params) {
     }
     throw new Error(`ShowDoc 返回的不是 JSON（可能地址/路径不对）。HTTP ${resp.status}，内容片段：${snippet}`)
   }
-  if (data.error_code && Number(data.error_code) !== 0) {
+  if (data.error_code !== undefined && Number(data.error_code) !== 0) {
+    const code = Number(data.error_code)
+    const msg = data.error_message || `ShowDoc 返回错误码 ${code}`
     // 999 是 ShowDoc 在 api_key/token/item_id 不正确或无权限时的典型「崩溃」错误码
-    if (Number(data.error_code) === 999) {
-      throw new Error(
-        'ShowDoc 拒绝了请求（error_code 999）。这是凭证/项目 ID 不对导致的，请逐项核对：\n' +
-        '① item_id 必须是「项目」ID（打开项目后地址栏 ?item_id= 后面的数字），不是某个接口页面的 ID；\n' +
-        '② api_key 与 api_token 必须来自「该项目」设置页里的「开放API」密钥对；\n' +
-        '③ 三项属于同一个项目；\n' +
-        '④ 若仍不行，可能是 ShowDoc 版本过旧，建议升级到最新版（该 999 是旧版已知 bug）。'
-      )
+    // 999 + parseTemplate 报错 = 该接口路由在此（老版 ThinkPHP3）私服上不存在，
+    // ThinkPHP 找不到方法转去渲染模板导致崩溃，属于「端点不存在」而非凭证错误
+    if (code === 999 && /parseTemplate/i.test(msg)) {
+      throw new Error(`[error_code=999] 该接口在此 ShowDoc 版本上不存在（${msg.slice(0, 80)}）`)
     }
-    throw new Error(data.error_message || `ShowDoc 返回错误码 ${data.error_code}`)
+    // 把 error_code 也带上，便于判断是鉴权失败还是其它错误
+    throw new Error(`[error_code=${code}] ${msg}`)
   }
   return data
 }
@@ -200,34 +199,170 @@ router.post('/showdoc/pages', async (req, res) => {
 })
 
 // 保存接口到 ShowDoc（pageId 缺省则新建）
-router.post('/showdoc/save', async (req, res) => {
+// 同时注册 /showdoc/save 与 /showdoc/update 两个路径：
+// 前端 web 模式调用 action='update'（对应桌面端 App.UpdatePage），
+// 旧版/部分调用使用 'save'，这里统一复用同一处理函数，避免 404。
+async function handleSave(req, res) {
   try {
-    const {
-      baseUrl,
-      apiKey,
-      apiToken,
-      itemId,
-      catId,
-      title,
-      content,
-      pageId
-    } = req.body
-    if (!itemId) return res.status(400).json({ error: '缺少 item_id' })
-    if (!catId) return res.status(400).json({ error: '缺少 cat_id（请选择或新建目录）' })
-    if (!title) return res.status(400).json({ error: '缺少接口标题' })
+    const b = req.body || {}
+    const { baseUrl, apiKey, apiToken, itemId, pageId } = b
+    // 兼容前端两套字段名：web save() 发的是 pageTitle/pageContent，
+    // 旧调用/桌面协议用 title/content。任取其一，避免字段错位导致「缺少接口标题」。
+    const catId = b.catId || b.cat_id || ''
+    const title = b.title || b.pageTitle || ''
+    const content = b.content != null ? b.content : (b.pageContent != null ? b.pageContent : '')
 
-    const data = await post(baseUrl, 'item/updateApiItem', {
-      api_key: apiKey,
-      api_token: apiToken,
-      item_id: itemId,
-      cat_id: catId,
-      title,
-      content: content || '',
-      page_id: pageId || ''
-    })
-    res.json({ ok: true, data: data.data })
+    if (!itemId) return res.status(400).json({ error: '缺少 item_id' })
+    if (!title) return res.status(400).json({ error: '缺少接口标题' })
+    // 更新已有页面（带 page_id）时 cat_id 可缺省；仅新建接口时必须指定目录
+    if (!pageId && !catId) return res.status(400).json({ error: '缺少 cat_id（请选择或新建目录）' })
+
+    // 候选保存接口：不同私服版本开放 API 端点名不同，自动尝试并报告各自结果。
+    // ① item/page/edit（新版，与桌面端 Go 一致）
+    // ② item/updateApiItem（部分版本）
+    // ③ item/updateByApi（官方 showdoc_api.sh 用的全版本通用接口，老版 ThinkPHP3 私服
+    //    只有这个可用；按 cat_name + page_title 定位页面，需先把 cat_id 解析成目录路径名）
+    const errors = []
+    const byIdCandidates = [
+      { path: 'item/page/edit', params: { page_title: title, page_content: content || '' } },
+      { path: 'item/updateApiItem', params: { title, content: content || '' } }
+    ]
+    for (const c of byIdCandidates) {
+      try {
+        const data = await post(baseUrl, c.path, {
+          api_key: apiKey,
+          api_token: apiToken,
+          item_id: itemId,
+          page_id: pageId || '',
+          cat_id: catId,
+          ...c.params
+        })
+        return res.json({ ok: true, data: data.data, used: c.path })
+      } catch (e) {
+        errors.push(`• ${c.path}：${e.message}`)
+      }
+    }
+
+    // 回退：item/updateByApi。需要 cat_name（目录名路径，多级用 "/" 分隔）。
+    try {
+      let catName = ''
+      let effectiveCatId = catId
+      // 通过 item/info 拉取目录树（该接口在此私服上已验证可用）
+      const info = await post(baseUrl, 'item/info', {
+        api_key: apiKey,
+        api_token: apiToken,
+        item_id: itemId
+      })
+      const { catalog, pages } = extractTree(info)
+      // 只传了 page_id 没传 cat_id 时，从页面列表反查其所属目录
+      if (!effectiveCatId && pageId) {
+        const p = pages.find((x) => String(x.page_id) === String(pageId))
+        if (p && p.cat_id != null) effectiveCatId = p.cat_id
+      }
+      if (effectiveCatId) {
+        const byId = new Map(catalog.map((c) => [String(c.cat_id), c]))
+        const parts = []
+        let cur = byId.get(String(effectiveCatId))
+        while (cur) {
+          parts.unshift(cur.cat_name)
+          const pid = cur.parent_cat_id
+          cur = pid == null || String(pid) === '0' || pid === '' ? null : byId.get(String(pid))
+        }
+        catName = parts.join('/')
+      }
+      const data = await post(baseUrl, 'item/updateByApi', {
+        api_key: apiKey,
+        api_token: apiToken,
+        cat_name: catName,
+        page_title: title,
+        page_content: content || ''
+      })
+      return res.json({ ok: true, data: data.data, used: 'item/updateByApi' })
+    } catch (e) {
+      errors.push(`• item/updateByApi：${e.message}`)
+    }
+    throw new Error('所有候选保存接口均失败：\n' + errors.join('\n'))
   } catch (err) {
     res.status(502).json({ error: `保存到 ShowDoc 失败：${err.message}` })
+  }
+}
+router.post('/showdoc/save', handleSave)
+router.post('/showdoc/update', handleSave)
+
+// ──────────────────────────────────────────────────────────────
+// AI 一键补全参数说明
+// 兼容 OpenAI / DeepSeek / 通义千问 等 OpenAI 协议接口。
+// 入参：{ ai:{ baseUrl, apiKey, model }, context:{ title, method, url }, items:[{name,type}] }
+// 返回：{ descriptions:[ "说明1", "说明2", ... ] }（顺序与 items 对齐）
+// ──────────────────────────────────────────────────────────────
+router.post('/ai/fill', async (req, res) => {
+  try {
+    const { ai, context, items } = req.body || {}
+    if (!ai || !ai.apiKey) return res.status(400).json({ error: '缺少 AI API Key（请在设置中填写）' })
+    if (!Array.isArray(items) || !items.length) return res.status(400).json({ error: '缺少待补全的参数' })
+
+    const base = (ai.baseUrl || '').trim().replace(/\/+$/, '') || 'https://api.openai.com/v1'
+    const model = ai.model || 'gpt-4o-mini'
+
+    const ctxLines = []
+    if (context?.title) ctxLines.push(`接口：${context.title}`)
+    if (context?.method) ctxLines.push(`请求方法：${context.method}`)
+    if (context?.url) ctxLines.push(`请求地址：${context.url}`)
+    const ctx = ctxLines.join('；')
+
+    const list = items
+      .map((it, i) => `${i + 1}. 参数名=${it.name || '-'} 类型=${it.type || '-'}`)
+      .join('\n')
+
+    const userMsg =
+      `请为以下 API 参数生成简洁的中文「说明/描述」，每行一条，用 JSON 数组返回（顺序与输入一致，纯字符串，不要包含 markdown、不要编号）。\n` +
+      (ctx ? `接口上下文：${ctx}\n` : '') +
+      `参数列表：\n${list}`
+
+    let resp
+    try {
+      resp = await fetch(base + '/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer ' + ai.apiKey
+        },
+        body: JSON.stringify({
+          model,
+          temperature: 0.3,
+          messages: [
+            { role: 'system', content: '你是 API 文档助手，擅长用一句话中文描述接口参数的含义与用途。只输出 JSON 数组，不要任何额外解释。' },
+            { role: 'user', content: userMsg }
+          ]
+        })
+      })
+    } catch (e) {
+      throw new Error(`无法连接 AI 服务（${base}）：${e.message}`)
+    }
+    const text = await resp.text()
+    let j
+    try {
+      j = JSON.parse(text)
+    } catch {
+      throw new Error(`AI 服务返回非 JSON（HTTP ${resp.status}）：${text.slice(0, 200)}`)
+    }
+    const contentText = (j?.choices?.[0]?.message?.content || '').trim()
+    const m = contentText.match(/\[[\s\S]*\]/)
+    let arr = []
+    if (m) {
+      try {
+        arr = JSON.parse(m[0])
+      } catch {
+        /* ignore */
+      }
+    }
+    if (!Array.isArray(arr) || !arr.length) {
+      throw new Error('AI 返回结果无法解析为说明数组')
+    }
+    const descriptions = arr.map((s) => String(s).replace(/\s+/g, ' ').trim())
+    res.json({ descriptions })
+  } catch (err) {
+    res.status(502).json({ error: `AI 补全失败：${err.message}` })
   }
 })
 
