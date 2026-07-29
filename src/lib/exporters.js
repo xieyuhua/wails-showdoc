@@ -60,9 +60,10 @@ function parseRunApi(decoded) {
   // GET / HEAD 等无 body 的请求不取 body 参数（RunApi 里 GET 误填的 body 会被忽略）；
   // 仅 POST / PUT / PATCH 等带 body 的请求才解析 body 表单参数。
   const hasBody = method !== 'GET' && method !== 'HEAD'
-  const body = hasBody
-    ? [...pick(pb.formdata, 'body'), ...pick(pb.urlencoded, 'body'), ...pick(pb.jsonDesc, 'body')]
-    : []
+  const bodyForm = hasBody ? pick(pb.formdata, 'body') : []
+  const bodyUrl = hasBody ? pick(pb.urlencoded, 'body') : []
+  const bodyJson = hasBody ? pick(pb.jsonDesc, 'body') : []
+  const body = [...bodyForm, ...bodyUrl, ...bodyJson]
   // 请求参数（body + query）与请求头
   const query = pick(req.query, 'query')
   const headers = pick(req.headers, 'header')
@@ -115,6 +116,9 @@ function parseRunApi(decoded) {
     title,
     params: reqParams,
     headers,
+    bodyForm,
+    bodyUrl,
+    bodyJson,
     respParams,
     respFailParams,
     respExample,
@@ -149,6 +153,9 @@ export function parsePage(page) {
       url: runapi.url,
       params: runapi.params,
       headers: runapi.headers,
+      bodyForm: runapi.bodyForm,
+      bodyUrl: runapi.bodyUrl,
+      bodyJson: runapi.bodyJson,
       respParams: runapi.respParams,
       respFailParams: runapi.respFailParams,
       respExample: runapi.respExample,
@@ -421,73 +428,217 @@ function mapType(t) {
   if (/bool/.test(s)) return 'boolean'
   if (/array|list|\[\]/.test(s)) return 'array'
   if (/object|map|json/.test(s)) return 'object'
+  if (/file|binary|upload|image|filepath|file_path/.test(s)) return 'file'
   return 'string'
 }
 
-export function toOpenApi(pages, catalog) {
+// 单个参数的 schema。OpenAPI 要求 array 必须带 items、object 必须带 properties，
+// 否则校验不过；file 类型按 multipart 的 string(binary) 处理。
+function toSchema(pr) {
+  const desc = pr.desc || pr.description || ''
+  const base = desc ? { description: desc } : {}
+  const type = mapType(pr.type)
+  if (type === 'array') {
+    return { ...base, type: 'array', items: { type: 'string' } }
+  }
+  if (type === 'object') {
+    return { ...base, type: 'object', properties: {} }
+  }
+  if (type === 'file') {
+    return { ...base, type: 'string', format: 'binary' }
+  }
+  return { ...base, type: type || 'string' }
+}
+
+// 把 ShowDoc 的 URL 规范化成 OpenAPI 的 (path, server)：
+//  - 完整 URL 提取 origin 作为 server，path 取 pathname
+//  - :param 风格（RunApi 常见）转成 {param}
+function normalizeUrl(urlStr) {
+  let path = urlStr || '/'
+  let server = null
+  try {
+    const u = new URL(urlStr)
+    server = u.origin // 如 https://api.example.com
+    path = u.pathname
+  } catch {
+    /* 非完整 URL，原样处理 */
+  }
+  path = path.replace(/:([A-Za-z][A-Za-z0-9_]*)/g, '{$1}')
+  if (!path) path = '/'
+  return { path, server }
+}
+
+function buildParameter(pr, loc) {
+  const p = {
+    name: pr.name,
+    in: loc,
+    schema: toSchema(pr)
+  }
+  if (loc !== 'path' && pr.required) p.required = true
+  if (pr.desc || pr.description) p.description = pr.desc || pr.description
+  return p
+}
+
+function tryJson(value) {
+  if (typeof value !== 'string') return value
+  try {
+    return JSON.parse(value)
+  } catch {
+    return value
+  }
+}
+
+function makeOperationId(p) {
+  const slug = (p.title || p.url || 'op')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+  return `${slug || 'op'}-${p.id || Math.random().toString(36).slice(2, 8)}`
+}
+
+// 生成符合 OpenAPI 3.0.3 标准的文档。
+// options: { title, version, servers }，未提供时从页面 URL 自动推断 server。
+export function toOpenApi(pages, catalog, options) {
+  const opts = options || {}
   const paths = {}
   const catPaths = buildCatPaths(catalog)
+
+  // 推断 server：仅当所有完整 URL 同源时才提取，避免把多域名混进一个 server
+  const serverSet = new Set()
   pages.forEach((p) => {
-    let path = p.url || '/'
-    try {
-      const x = new URL(p.url)
-      path = x.pathname || '/'
-    } catch {
-      /* keep raw */
-    }
+    const { server } = normalizeUrl(p.url)
+    if (server) serverSet.add(server)
+  })
+  const inferredServer = serverSet.size === 1 ? [...serverSet][0] : null
+  const servers =
+    opts.servers && opts.servers.length
+      ? opts.servers
+      : inferredServer
+      ? [{ url: inferredServer }]
+      : []
+
+  pages.forEach((p) => {
+    const { path } = normalizeUrl(p.url)
     const method = (p.method || 'GET').toLowerCase()
     if (!paths[path]) paths[path] = {}
-    // 响应参数（来自 response.responseParamsDesc）单独构建 200 响应 schema
+    if (paths[path][method]) return // 同 path+method 已存在则跳过，避免覆盖
+
+    // ── parameters：query + header + path ──
+    const parameters = []
+    // query 参数（来自 params 中 kind==='query'）
+    ;(p.params || []).forEach((pr) => {
+      // 无 kind（普通 Markdown 文档）默认按 query 处理，避免参数被整体丢弃
+      if ((!pr.kind || pr.kind === 'query') && pr.name) parameters.push(buildParameter(pr, 'query'))
+    })
+    // header 参数（之前被完全忽略，这里补上）
+    ;(p.headers || []).forEach((pr) => {
+      if (pr.name) parameters.push(buildParameter(pr, 'header'))
+    })
+    // path 参数：从 URL 模板里的 {xxx} 推导，必须 required
+    const pathNames = (path.match(/\{[^}]+\}/g) || []).map((s) => s.slice(1, -1))
+    pathNames.forEach((name) => {
+      parameters.push({ name, in: 'path', required: true, schema: { type: 'string' } })
+    })
+
+    // ── requestBody：按原始类型区分 content-type ──
+    const form = p.bodyForm || []
+    const urlenc = p.bodyUrl || []
+    const json = p.bodyJson || []
+    // 优先 json，其次 form-data，再 urlencoded
+    let contentType = null
+    let src = []
+    if (json.length) {
+      contentType = 'application/json'
+      src = json
+    } else if (form.length) {
+      contentType = 'multipart/form-data'
+      src = form
+    } else if (urlenc.length) {
+      contentType = 'application/x-www-form-urlencoded'
+      src = urlenc
+    }
+    if (!src.length && p.params) {
+      // 兼容普通 Markdown 文档：没有分类 body 时，把 kind==='body' 的当作 JSON
+      const fallback = p.params.filter((x) => x.kind === 'body')
+      if (fallback.length) {
+        contentType = 'application/json'
+        src = fallback
+      }
+    }
+    let requestBody
+    if (src.length && contentType) {
+      const props = {}
+      const required = []
+      src.forEach((pr) => {
+        if (!pr.name) return
+        props[pr.name] = toSchema(pr)
+        if (pr.required) required.push(pr.name)
+      })
+      requestBody = {
+        content: {
+          [contentType]: {
+            schema: {
+              type: 'object',
+              properties: props,
+              ...(required.length ? { required } : {})
+            }
+          }
+        }
+      }
+    }
+
+    // ── responses ──
     const respProps = {}
     ;(p.respParams || []).forEach((pr) => {
-      if (pr.name) respProps[pr.name] = { type: mapType(pr.type), description: pr.desc }
+      if (pr.name) respProps[pr.name] = toSchema(pr)
     })
-    const okResponse = { description: 'OK' }
+    const okResponse = { description: '成功' }
     if (Object.keys(respProps).length) {
       okResponse.content = {
         'application/json': { schema: { type: 'object', properties: respProps } }
       }
     }
-    const catPathArr = catPaths[String(p.id)] || []
-    paths[path][method] = {
-      summary: p.title,
-      operationId: String(p.id),
-      ...(catPathArr.length ? { tags: [catPathArr.join(' / ')] } : {}),
-      parameters: (p.params || [])
-        .filter((pr) => (pr.kind || 'query') === 'query')
-        .map((pr) => ({
-          name: pr.name,
-          in: 'query',
-          required: !!pr.required,
-          description: pr.desc,
-          schema: { type: mapType(pr.type) }
-        })),
-      responses: { '200': okResponse }
+    if (p.respExample) {
+      okResponse.content = okResponse.content || {
+        'application/json': { schema: { type: 'object' } }
+      }
+      okResponse.content['application/json'].example = tryJson(p.respExample)
     }
-    // body 参数（非 query）放入 requestBody
-    const bodyParams = (p.params || []).filter((pr) => (pr.kind || 'query') !== 'query')
-    if (bodyParams.length) {
-      const props = {}
-      const required = []
-      bodyParams.forEach((pr) => {
-        if (!pr.name) return
-        props[pr.name] = { type: mapType(pr.type), description: pr.desc }
-        if (pr.required) required.push(pr.name)
+    const responses = { '200': okResponse }
+    if ((p.respFailParams || []).length) {
+      const failProps = {}
+      p.respFailParams.forEach((pr) => {
+        if (pr.name) failProps[pr.name] = toSchema(pr)
       })
-      paths[path][method].requestBody = {
-        content: {
-          'application/json': {
-            schema: { type: 'object', properties: props, ...(required.length ? { required } : {}) }
-          }
-        }
+      responses['400'] = {
+        description: '失败响应',
+        content: { 'application/json': { schema: { type: 'object', properties: failProps } } }
       }
     }
+
+    // ── operation 组装 ──
+    const catPathArr = catPaths[String(p.catId)] || []
+    const op = {
+      operationId: makeOperationId(p),
+      summary: p.title,
+      ...(catPathArr.length ? { tags: [catPathArr.join(' / ')] } : {}),
+      ...(parameters.length ? { parameters } : {}),
+      ...(requestBody ? { requestBody } : {}),
+      responses
+    }
+    // 清理 undefined 字段，保证产物干净
+    Object.keys(op).forEach((k) => op[k] === undefined && delete op[k])
+
+    paths[path][method] = op
   })
-  return {
-    openapi: '3.0.0',
-    info: { title: 'ShowDoc API', version: '1.0.0' },
+
+  const doc = {
+    openapi: '3.0.3',
+    info: { title: opts.title || 'ShowDoc API', version: opts.version || '1.0.0' },
     paths
   }
+  if (servers.length) doc.servers = servers
+  return doc
 }
 
 export function toPostman(pages, catalog) {
