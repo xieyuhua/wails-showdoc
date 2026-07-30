@@ -508,29 +508,29 @@ function toSchema(pr) {
 
 // 把 ShowDoc 的 URL 规范化成 OpenAPI 的 (path, server)：
 //  - 完整 URL 提取 origin 作为 server，path 取 pathname
-//  - :param 风格（RunApi 常见）转成 {param}
-//  - 开头的 {{host}}/ 是「服务变量」而非路径参数，抽出来作为 serverVar 并从 path 剥离
+//  - 模板 URL（ShowDoc 常见，如 {{host}}/v2_api/... 或 {host}/...）开头的环境变量
+//    占位符原样保留（如 '{{host}}'）作为 server，剩余部分作为 path，避免被误转成 {host}
+//  - :param 风格（RunApi 常见）转成 {param}（OpenAPI 标准路径参数语法）
 function normalizeUrl(urlStr) {
-  let path = urlStr || '/'
+  const raw = urlStr || '/'
   let server = null
-  let serverVar = null
+  let path = raw
   try {
-    const u = new URL(urlStr)
+    const u = new URL(raw)
     server = u.origin // 如 https://api.example.com
     path = u.pathname
   } catch {
-    // 模板 URL（ShowDoc 常见）：{{host}}/v2_api/... 或 {host}/...
-    // 开头的 {{host}} 是「服务变量」，应作为 OpenAPI server variable，而非 path 参数；
-    // 故把开头这段剥离后再走 :param 规范化。
-    const m = path.match(/^\{+([A-Za-z_][A-Za-z0-9_]*)\}+/)
+    // 模板 URL：开头为变量占位符（{{var}} 或 {var}）时，原样保留为 server，
+    // 剩余路径部分继续走 :param 规范化。
+    const m = raw.match(/^(\{+[A-Za-z_][A-Za-z0-9_]*\}+)(.*)$/)
     if (m) {
-      serverVar = m[1] // 如 'host'
-      path = path.slice(m[0].length) // 去掉 '{{host}}'，保留后面的 '/v2_api/...'
+      server = m[1] // 保留原样，如 '{{host}}'
+      path = m[2] || '/'
     }
   }
   path = path.replace(/:([A-Za-z][A-Za-z0-9_]*)/g, '{$1}')
   if (!path) path = '/'
-  return { path, server, serverVar }
+  return { path, server }
 }
 
 function buildParameter(pr, loc) {
@@ -575,28 +575,25 @@ export function toOpenApi(pages, catalog, options) {
   const paths = {}
   const catPaths = buildCatPaths(catalog)
 
-  // 推断 server：完整 URL 提取 origin；模板 URL（如 {{host}}/...）提取服务变量
-  const serverSet = new Set()
-  const serverVarSet = new Set()
+  // 推断 server：
+  //  - 完整 URL 提取 origin（仅当所有接口同源才使用，避免多域名强行合并）
+  //  - 模板 URL（如 {{host}}/...）开头的占位符原样保留为 server url，不转成 {host}
+  const originSet = new Set()
+  const templateServers = new Set()
   pages.forEach((p) => {
-    const { server, serverVar } = normalizeUrl(p.url)
-    if (server) serverSet.add(server)
-    if (serverVar) serverVarSet.add(serverVar)
+    const { server } = normalizeUrl(p.url)
+    if (!server) return
+    if (server.startsWith('{')) templateServers.add(server)
+    else originSet.add(server)
   })
-  const inferredServer = serverSet.size === 1 ? [...serverSet][0] : null
   let servers = []
   if (opts.servers && opts.servers.length) {
     servers = opts.servers
-  } else if (inferredServer) {
-    servers = [{ url: inferredServer }]
-  } else if (serverVarSet.size) {
-    // 模板 URL：把开头的服务变量（如 host）作为 OpenAPI server variable，
-    // 而非当成接口路径参数
-    const variables = {}
-    serverVarSet.forEach((v) => {
-      variables[v] = { default: 'https://example.com', description: `${v} 服务器地址` }
-    })
-    servers = [{ url: `{${[...serverVarSet].join('/')}}`, variables }]
+  } else if (templateServers.size) {
+    // 模板占位符（如 {{host}}）原样输出为 server，保留 ShowDoc 环境变量写法（优先于完整 URL）
+    servers = [...templateServers].map((url) => ({ url }))
+  } else if (originSet.size === 1) {
+    servers = [{ url: [...originSet][0] }]
   }
 
   pages.forEach((p) => {
