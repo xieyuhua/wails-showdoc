@@ -87,15 +87,17 @@ async function post(baseUrl, path, params) {
 
 // 从 ShowDoc 返回的任意嵌套结构中，深度扫描提取全部目录(catalog)与页面(pages)。
 // 不依赖固定字段层级（兼容 item/info、item/show 及各版本不同包装）。
+// 同时把父目录的 cat_id「向下传递」给嵌套页面：即使某个 ShowDoc 版本没有在
+// page 节点上写 cat_id，也能保证页面归属到正确的目录（否则导出选择列表会全部平铺）。
 function extractTree(root) {
   const catalog = []
   const pages = []
   const seenCat = new Set()
   const seenPage = new Set()
 
-  function walk(node) {
+  function walk(node, inheritedCatId) {
     if (Array.isArray(node)) {
-      node.forEach(walk)
+      node.forEach((n) => walk(n, inheritedCatId))
       return
     }
     if (!node || typeof node !== 'object') return
@@ -109,26 +111,30 @@ function extractTree(root) {
           cat_id: node.cat_id,
           cat_name: node.cat_name,
           level: Number(node.level) || 1,
-          parent_cat_id: node.parent_cat_id ?? null
+          parent_cat_id: node.parent_cat_id ?? inheritedCatId ?? null
         })
       }
+      // 进入该目录子节点时，以当前目录 id 作为继承值
+      inheritedCatId = id
     }
     // 页面：同时具备 page_id 与 page_title
     if (node.page_id !== undefined && node.page_title !== undefined) {
       const id = String(node.page_id)
       if (!seenPage.has(id)) {
         seenPage.add(id)
-        pages.push(node)
+        // 页面自身没有 cat_id 时，继承父目录 id
+        const pageNode = node.cat_id !== undefined ? node : { ...node, cat_id: inheritedCatId }
+        pages.push(pageNode)
       }
     }
     // 继续向下遍历（跳过原始大字符串，避免无意义扫描）
     for (const k of Object.keys(node)) {
       const v = node[k]
-      if (v && typeof v === 'object') walk(v)
+      if (v && typeof v === 'object') walk(v, inheritedCatId)
     }
   }
 
-  walk(root)
+  walk(root, null)
   return { catalog, pages }
 }
 
@@ -383,6 +389,101 @@ router.post('/showdoc/catalog', async (req, res) => {
     res.json({ ok: true, catId: data.data && data.data.cat_id })
   } catch (err) {
     res.status(502).json({ error: `新建目录失败：${err.message}` })
+  }
+})
+
+// ──────────────────────────────────────────────────────────────
+// 导入 OpenAPI：把已解析好的接口页面（含目录路径 + RunApi 内容）写回 ShowDoc。
+// 入参：{ baseUrl, apiKey, apiToken, itemId, pages:[{ catPath:[], pageTitle, pageContent }] }
+// 行为：
+//  1. 先拉取现有目录，复用已存在的目录（避免重复建目录）
+//  2. 按 catPath 逐级确保目录存在（缺失才新建）
+//  3. 逐页用 item/page/edit 新建接口（page_id 留空 = 新建）
+// ──────────────────────────────────────────────────────────────
+async function doImportOpenApi(baseUrl, apiKey, apiToken, itemId, pages) {
+  // 目录路径缓存："用户管理/账号" -> catId
+  const pathCache = new Map()
+
+  // 拉一次现有目录，把已存在目录的完整路径缓存起来，避免重复创建
+  try {
+    const info = await post(baseUrl, 'item/info', {
+      api_key: apiKey,
+      api_token: apiToken,
+      item_id: itemId
+    })
+    const { catalog } = extractTree(info)
+    const byId = new Map(catalog.map((c) => [String(c.cat_id), c]))
+    const pathOf = (cid) => {
+      const parts = []
+      let cur = byId.get(String(cid))
+      while (cur) {
+        parts.unshift(cur.cat_name)
+        const pid = cur.parent_cat_id
+        cur = pid == null || String(pid) === '0' || pid === '' ? null : byId.get(String(pid))
+      }
+      return parts.join('/')
+    }
+    catalog.forEach((c) => pathCache.set(pathOf(c.cat_id), String(c.cat_id)))
+  } catch {
+    // 拿不到现有目录也能继续（只是每次都会新建目录）
+  }
+
+  const created = []
+  const failed = []
+  const errors = []
+  for (const pg of pages) {
+    try {
+      const catPath = pg.catPath && pg.catPath.length ? pg.catPath : ['(未分类)']
+      let parent = '0'
+      let acc = ''
+      for (const name of catPath) {
+        acc = acc ? acc + '/' + name : name
+        if (pathCache.has(acc)) {
+          parent = pathCache.get(acc)
+          continue
+        }
+        const data = await post(baseUrl, 'item/insertCatalog', {
+          api_key: apiKey,
+          api_token: apiToken,
+          item_id: itemId,
+          cat_name: name,
+          parent_cat_id: parent
+        })
+        const catId = data && data.data && data.data.cat_id
+        if (catId == null) throw new Error('新建目录未返回 cat_id')
+        const sid = String(catId)
+        pathCache.set(acc, sid)
+        parent = sid
+      }
+      await post(baseUrl, 'item/page/edit', {
+        api_key: apiKey,
+        api_token: apiToken,
+        item_id: itemId,
+        page_id: '',
+        cat_id: parent,
+        page_title: pg.pageTitle,
+        page_content: pg.pageContent || ''
+      })
+      created.push({ pageTitle: pg.pageTitle, catPath: acc })
+    } catch (e) {
+      failed.push({ pageTitle: pg.pageTitle, error: e.message })
+      errors.push(`• ${pg.pageTitle}：${e.message}`)
+    }
+  }
+  return { ok: true, total: pages.length, created: created.length, failed: failed.length, errors }
+}
+
+router.post('/showdoc/importOpenapi', async (req, res) => {
+  try {
+    const { baseUrl, apiKey, apiToken, itemId, pages } = req.body
+    if (!itemId) return res.status(400).json({ error: '缺少 item_id（ShowDoc 项目 ID）' })
+    if (!Array.isArray(pages) || !pages.length) {
+      return res.status(400).json({ error: '缺少要导入的 pages' })
+    }
+    const result = await doImportOpenApi(baseUrl, apiKey, apiToken, itemId, pages)
+    res.json(result)
+  } catch (err) {
+    res.status(502).json({ error: `导入 OpenAPI 失败：${err.message}` })
   }
 })
 

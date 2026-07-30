@@ -14,6 +14,10 @@ export function GetTree(arg1, arg2, arg3, arg4) {
   return window['go']['main']['App']['GetTree'](arg1, arg2, arg3, arg4);
 }
 
+export function ImportOpenApi(arg1, arg2, arg3, arg4, arg5) {
+  return window['go']['main']['App']['ImportOpenApi'](arg1, arg2, arg3, arg4, arg5);
+}
+
 export function LoadConfigFile() {
   return window['go']['main']['App']['LoadConfigFile']();
 }

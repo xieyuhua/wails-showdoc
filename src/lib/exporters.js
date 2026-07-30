@@ -47,6 +47,8 @@ function parseRunApi(decoded) {
     required: p.require === '1' || p.require === 'true' || p.require === true,
     type: p.type || '',
     desc: p.remark || p.description || '',
+    // RunApi 字段可能带 value / default（示例值）；优先 value 再 default
+    value: p.value != null && p.value !== '' ? p.value : p.default != null ? p.default : '',
     kind
   })
   // 过滤：跳过被禁用行(disable==1)以及 RunApi 自带的空占位行(name 为空)
@@ -271,11 +273,17 @@ export function buildCatTree(catalog) {
   return build(null)
 }
 
+// 统一读取页面的目录 ID：兼容 ShowDoc 原始字段 cat_id 与解析后的 catId
+export function getCatId(p) {
+  const cid = p.catId != null ? p.catId : p.cat_id
+  return cid == null || cid === '' || cid === 0 || cid === '0' ? null : String(cid)
+}
+
 // 页面按 cat_id 分组（null/空/0 归到 null）
 export function groupPagesByCat(pages) {
   const groups = {}
   pages.forEach((p) => {
-    const cid = p.catId == null || p.catId === '' || p.catId === 0 || p.catId === '0' ? null : String(p.catId)
+    const cid = getCatId(p)
     ;(groups[cid] = groups[cid] || []).push(p)
   })
   return groups
@@ -315,7 +323,7 @@ export function toMarkdown(pages, catalog) {
   // 未归类页面（catId 为空或不在 catalog 中）
   const catIds = new Set((catalog || []).map((c) => String(c.cat_id)))
   const orphans = pages.filter((p) => {
-    const cid = p.catId == null || p.catId === '' || p.catId === 0 || p.catId === '0' ? null : String(p.catId)
+    const cid = getCatId(p)
     return cid === null || !catIds.has(cid)
   })
   if (orphans.length) {
@@ -432,14 +440,62 @@ function mapType(t) {
   return 'string'
 }
 
+// 把 RunApi 字段的「字符串值」按 schema 类型强制转换成对应 JS 类型，
+// 使导出的 example 与 type 严格匹配（如 type=number 时 example 应为数字 18，而非 "18"）。
+function coerceExample(value, type) {
+  if (value === '' || value == null) return undefined
+  if (type === 'number') {
+    const n = Number(value)
+    return Number.isNaN(n) ? value : n
+  }
+  if (type === 'boolean') {
+    if (value === 'true' || value === true || value === 1 || value === '1') return true
+    if (value === 'false' || value === false || value === 0 || value === '0') return false
+    return value
+  }
+  if (type === 'array') {
+    try {
+      const a = JSON.parse(value)
+      return Array.isArray(a) ? a : value
+    } catch {
+      return value
+    }
+  }
+  if (type === 'object') {
+    try {
+      const o = JSON.parse(value)
+      return o && typeof o === 'object' ? o : value
+    } catch {
+      return value
+    }
+  }
+  return value // string 原样返回
+}
+
 // 单个参数的 schema。OpenAPI 要求 array 必须带 items、object 必须带 properties，
 // 否则校验不过；file 类型按 multipart 的 string(binary) 处理。
+// 同时把字段的「值」（RunApi 的 value/default）作为 example 写进 schema，
+// 这样导出的 OpenAPI 既含「字段 + 类型」，也含「示例值」，且 example 类型与 type 一致。
 function toSchema(pr) {
   const desc = pr.desc || pr.description || ''
   const base = desc ? { description: desc } : {}
   const type = mapType(pr.type)
+  // 字段示例值：优先参数自带的 value/default
+  let raw = pr.value
+  if (raw === '' || raw == null) {
+    const ex = pr['x-example'] || pr.example
+    if (ex != null && ex !== '') raw = ex
+  }
+  const example = raw !== '' && raw != null ? coerceExample(raw, type) : undefined
+  if (example !== undefined) base.example = example
   if (type === 'array') {
-    return { ...base, type: 'array', items: { type: 'string' } }
+    // items 的类型优先沿用数组元素类型提示（如 int[] 取 int），否则 string
+    const itemType = (pr.type || '').replace(/\[\]$/, '').trim()
+    const it = itemType ? mapType(itemType) : 'string'
+    const items = { type: it === 'array' ? 'string' : it }
+    // items 示例：取数组示例的首个元素（如 [1,2] -> 1），与 itemType 匹配
+    if (Array.isArray(example) && example.length) items.example = example[0]
+    return { ...base, type: 'array', items }
   }
   if (type === 'object') {
     return { ...base, type: 'object', properties: {} }
@@ -469,10 +525,17 @@ function normalizeUrl(urlStr) {
 }
 
 function buildParameter(pr, loc) {
+  const schema = toSchema(pr)
   const p = {
     name: pr.name,
     in: loc,
-    schema: toSchema(pr)
+    schema
+  }
+  // OpenAPI 3.0 规范：参数示例应放在 Parameter 顶层（与 schema 平级），
+  // 而非塞进 schema 内部；故把 example 从 schema 上移到参数层。
+  if (schema.example !== undefined) {
+    p.example = schema.example
+    delete schema.example
   }
   if (loc !== 'path' && pr.required) p.required = true
   if (pr.desc || pr.description) p.description = pr.desc || pr.description
@@ -534,8 +597,12 @@ export function toOpenApi(pages, catalog, options) {
     ;(p.headers || []).forEach((pr) => {
       if (pr.name) parameters.push(buildParameter(pr, 'header'))
     })
-    // path 参数：从 URL 模板里的 {xxx} 推导，必须 required
-    const pathNames = (path.match(/\{[^}]+\}/g) || []).map((s) => s.slice(1, -1))
+    // path 参数：从 URL 模板里的 {xxx} 推导，必须 required。
+    // 注意 ShowDoc 里 Host 等变量常写成「双花括号」{{host}}，故用 replace 剥掉所有
+    // 包裹的花括号（而不是 slice(1,-1) 只去一层），避免残留多余的 { 或 }。
+    const pathNames = (path.match(/\{[^}]+\}/g) || [])
+      .map((s) => s.replace(/[{}]/g, '').trim())
+      .filter(Boolean)
     pathNames.forEach((name) => {
       parameters.push({ name, in: 'path', required: true, schema: { type: 'string' } })
     })
@@ -574,7 +641,10 @@ export function toOpenApi(pages, catalog, options) {
         props[pr.name] = toSchema(pr)
         if (pr.required) required.push(pr.name)
       })
+      // OpenAPI 规范：requestBody 有 required 字段（缺省 false）。
+      // 存在必填 body 字段时显式标记为 true，更贴合标准。
       requestBody = {
+        ...(required.length ? { required: true } : {}),
         content: {
           [contentType]: {
             schema: {
@@ -617,7 +687,7 @@ export function toOpenApi(pages, catalog, options) {
     }
 
     // ── operation 组装 ──
-    const catPathArr = catPaths[String(p.catId)] || []
+    const catPathArr = catPaths[getCatId(p)] || []
     const op = {
       operationId: makeOperationId(p),
       summary: p.title,
@@ -676,7 +746,7 @@ export function toPostman(pages, catalog) {
   // 未归类页面（catId 为空或不在 catalog 中）
   const catIds = new Set((catalog || []).map((c) => String(c.cat_id)))
   const orphans = pages.filter((p) => {
-    const cid = p.catId == null || p.catId === '' || p.catId === 0 || p.catId === '0' ? null : String(p.catId)
+    const cid = getCatId(p)
     return cid === null || !catIds.has(cid)
   })
   items.push(...orphans.map(toItem))

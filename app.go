@@ -158,14 +158,16 @@ func (a *App) post(baseUrl, p string, params map[string]string) (map[string]inte
 }
 
 // extractTree 从 ShowDoc 返回的任意嵌套结构中深度扫描，提取全部目录(catalog)与页面(pages)
+// 同时把父目录的 cat_id「向下传递」给嵌套页面：即使某个 ShowDoc 版本没有在 page 节点上
+// 写 cat_id，也能保证页面归属到正确的目录（否则导出选择列表会全部平铺到顶层）。
 func extractTree(root interface{}) map[string]interface{} {
 	catalog := []map[string]interface{}{}
 	pages := []interface{}{}
 	seenCat := map[string]bool{}
 	seenPage := map[string]bool{}
 
-	var walk func(node interface{})
-	walk = func(node interface{}) {
+	var walk func(node interface{}, inheritedCatId interface{})
+	walk = func(node interface{}, inheritedCatId interface{}) {
 		switch n := node.(type) {
 		case map[string]interface{}:
 			// 目录：同时具备 cat_id 与 cat_name
@@ -188,6 +190,8 @@ func extractTree(root interface{}) map[string]interface{} {
 						var parent interface{} = nil
 						if pc, ok := n["parent_cat_id"]; ok {
 							parent = pc
+						} else {
+							parent = inheritedCatId
 						}
 						catalog = append(catalog, map[string]interface{}{
 							"cat_id":        n["cat_id"],
@@ -196,6 +200,8 @@ func extractTree(root interface{}) map[string]interface{} {
 							"parent_cat_id": parent,
 						})
 					}
+					// 进入该目录子节点时，以当前目录 id 作为继承值
+					inheritedCatId = n["cat_id"]
 				}
 			}
 			// 页面：同时具备 page_id 与 page_title
@@ -204,24 +210,34 @@ func extractTree(root interface{}) map[string]interface{} {
 					id := fmt.Sprintf("%v", n["page_id"])
 					if !seenPage[id] {
 						seenPage[id] = true
-						pages = append(pages, n)
+						// 页面自身没有 cat_id 时，继承父目录 id
+						if _, has := n["cat_id"]; !has {
+							child := map[string]interface{}{}
+							for k, v := range n {
+								child[k] = v
+							}
+							child["cat_id"] = inheritedCatId
+							pages = append(pages, child)
+						} else {
+							pages = append(pages, n)
+						}
 					}
 				}
 			}
 			for _, v := range n {
 				if vm, ok := v.(map[string]interface{}); ok {
-					walk(vm)
+					walk(vm, inheritedCatId)
 				} else if va, ok := v.([]interface{}); ok {
-					walk(va)
+					walk(va, inheritedCatId)
 				}
 			}
 		case []interface{}:
 			for _, item := range n {
-				walk(item)
+				walk(item, inheritedCatId)
 			}
 		}
 	}
-	walk(root)
+	walk(root, nil)
 	return map[string]interface{}{"catalog": catalog, "pages": pages}
 }
 
@@ -312,4 +328,147 @@ func (a *App) UpdatePage(baseUrl, apiKey, apiToken, itemId, pageId, catId, pageT
 		return nil, err
 	}
 	return data, nil
+}
+
+// importPage 是前端传入的单个待导入页面
+type importPage struct {
+	CatPath     []string `json:"catPath"`
+	PageTitle   string   `json:"pageTitle"`
+	PageContent string   `json:"pageContent"`
+}
+
+// ImportOpenApi 把前端解析好的接口页面（含目录路径 + RunApi 内容）批量写回 ShowDoc。
+//  1. 先拉取现有目录，复用已存在的目录（避免重复建目录）
+//  2. 按 CatPath 逐级确保目录存在（缺失才新建）
+//  3. 逐页用 item/page/edit 新建接口（page_id 留空 = 新建）
+//
+// pagesJson 必须是 importPage 数组的 JSON 字符串。
+func (a *App) ImportOpenApi(baseUrl, apiKey, apiToken, itemId, pagesJson string) (map[string]interface{}, error) {
+	if strings.TrimSpace(itemId) == "" {
+		return nil, fmt.Errorf("缺少 item_id（ShowDoc 项目 ID）")
+	}
+	var pages []importPage
+	if err := json.Unmarshal([]byte(pagesJson), &pages); err != nil {
+		return nil, fmt.Errorf("pages 不是合法 JSON：%s", err.Error())
+	}
+	if len(pages) == 0 {
+		return nil, fmt.Errorf("缺少要导入的 pages")
+	}
+
+	// 目录路径缓存："用户管理/账号" -> catId
+	pathCache := map[string]string{}
+
+	// 拉一次现有目录，把已存在目录的完整路径缓存起来，避免重复创建
+	if info, err := a.post(baseUrl, "item/info", map[string]string{
+		"api_key":   apiKey,
+		"api_token": apiToken,
+		"item_id":   itemId,
+	}); err == nil {
+		if extracted, ok := info["data"]; ok {
+			ex := extractTree(extracted)
+			if cats, ok := ex["catalog"].([]map[string]interface{}); ok {
+				byId := map[string]map[string]interface{}{}
+				for _, c := range cats {
+					id := fmt.Sprintf("%v", c["cat_id"])
+					byId[id] = c
+				}
+				pathOf := func(cid string) string {
+					parts := []string{}
+					cur, ok := byId[cid]
+					for ok {
+						parts = append([]string{fmt.Sprintf("%v", cur["cat_name"])}, parts...)
+						pid := fmt.Sprintf("%v", cur["parent_cat_id"])
+						if pid == "" || pid == "0" || pid == "<nil>" {
+							break
+						}
+						cur, ok = byId[pid]
+					}
+					return strings.Join(parts, "/")
+				}
+				for _, c := range cats {
+					pathCache[pathOf(fmt.Sprintf("%v", c["cat_id"]))] = fmt.Sprintf("%v", c["cat_id"])
+				}
+			}
+		}
+	}
+
+	created := 0
+	failed := 0
+	errors := []string{}
+	for _, pg := range pages {
+		catPath := pg.CatPath
+		if len(catPath) == 0 {
+			catPath = []string{"(未分类)"}
+		}
+		parent := ""
+		acc := ""
+		ok := true
+		for _, name := range catPath {
+			if acc == "" {
+				acc = name
+			} else {
+				acc = acc + "/" + name
+			}
+			if v, exists := pathCache[acc]; exists {
+				parent = v
+				continue
+			}
+			pc := parent
+			if pc == "" {
+				pc = "0"
+			}
+			d, err := a.post(baseUrl, "item/insertCatalog", map[string]string{
+				"api_key":       apiKey,
+				"api_token":     apiToken,
+				"item_id":       itemId,
+				"cat_name":      name,
+				"parent_cat_id": pc,
+			})
+			if err != nil {
+				errors = append(errors, fmt.Sprintf("• %s：新建目录失败 %s", pg.PageTitle, err.Error()))
+				failed++
+				ok = false
+				break
+			}
+			catId := ""
+			if data, ok2 := d["data"].(map[string]interface{}); ok2 {
+				catId = fmt.Sprintf("%v", data["cat_id"])
+			}
+			if catId == "" || catId == "<nil>" {
+				errors = append(errors, fmt.Sprintf("• %s：新建目录未返回 cat_id", pg.PageTitle))
+				failed++
+				ok = false
+				break
+			}
+			pathCache[acc] = catId
+			parent = catId
+		}
+		if !ok {
+			continue
+		}
+		if parent == "" {
+			parent = "0"
+		}
+		if _, err := a.post(baseUrl, "item/page/edit", map[string]string{
+			"api_key":      apiKey,
+			"api_token":    apiToken,
+			"item_id":      itemId,
+			"page_id":      "",
+			"cat_id":       parent,
+			"page_title":   pg.PageTitle,
+			"page_content": pg.PageContent,
+		}); err != nil {
+			errors = append(errors, fmt.Sprintf("• %s：%s", pg.PageTitle, err.Error()))
+			failed++
+			continue
+		}
+		created++
+	}
+	return map[string]interface{}{
+		"ok":      true,
+		"total":   len(pages),
+		"created": created,
+		"failed":  failed,
+		"errors":  errors,
+	}, nil
 }

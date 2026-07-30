@@ -3,6 +3,7 @@ import { reactive, ref, watch } from 'vue'
 import ShowDocPanel from './components/ShowDocPanel.vue'
 import ExportPanel from './components/ExportPanel.vue'
 import ApiEditor from './components/ApiEditor.vue'
+import OpenApiImport from './components/OpenApiImport.vue'
 import { callShowdoc, loadConfig } from './lib/api.js'
 
 const sdConfig = reactive({
@@ -168,10 +169,12 @@ async function loadTree() {
         <div class="tabs">
           <button :class="{ active: mainTab === 'export' }" @click="mainTab = 'export'">导出文档</button>
           <button :class="{ active: mainTab === 'editor' }" @click="mainTab = 'editor'">接口查看 / 编辑</button>
+          <button :class="{ active: mainTab === 'import' }" @click="mainTab = 'import'">导入 OpenAPI</button>
         </div>
 
         <ExportPanel v-show="mainTab === 'export'" :tree="tree" :config="sdConfig" />
         <ApiEditor v-if="mainTab === 'editor'" :tree="tree" :config="sdConfig" />
+        <OpenApiImport v-if="mainTab === 'import'" :config="sdConfig" @imported="loadTree" />
       </section>
     </main>
   </div>

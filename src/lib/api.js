@@ -161,3 +161,38 @@ export async function callAI(payload) {
 }
 
 export { callShowdoc }
+
+// 导入 OpenAPI：
+//  - 网页模式：POST /api/showdoc/importOpenapi（node server 负责建目录 + 建页面）
+//  - 桌面模式：调用 Go App.ImportOpenApi；若当前打包版本尚未包含该方法，回退网页分支
+// 入参 payload：{ baseUrl, apiKey, apiToken, itemId, pages:[{ catPath, pageTitle, pageContent }] }
+export async function importOpenapi(payload) {
+  const pages = payload.pages || []
+  if (isPureBrowser()) {
+    return webMode('importOpenapi', { ...payload, pages, pageIds: undefined })
+  }
+  // 桌面端
+  try {
+    if (window.go && window.go.main && window.go.main.App && window.go.main.App.ImportOpenApi) {
+      return (
+        (await window.go.main.App.ImportOpenApi(
+          payload.baseUrl,
+          payload.apiKey,
+          payload.apiToken,
+          payload.itemId,
+          JSON.stringify(pages)
+        )) || {}
+      )
+    }
+  } catch (e) {
+    return { error: (e && e.message) || String(e) }
+  }
+  // 当前打包版本未包含 ImportOpenApi，回退网页分支
+  const r = await webMode('importOpenapi', { ...payload, pages })
+  if (r && r.error && /Failed to fetch|fetch|网络/.test(r.error || '')) {
+    return {
+      error: '当前桌面端尚未编译「导入 OpenAPI」功能，请使用「网页预览」模式，或重新打包桌面端后再用。'
+    }
+  }
+  return r
+}
