@@ -509,19 +509,28 @@ function toSchema(pr) {
 // 把 ShowDoc 的 URL 规范化成 OpenAPI 的 (path, server)：
 //  - 完整 URL 提取 origin 作为 server，path 取 pathname
 //  - :param 风格（RunApi 常见）转成 {param}
+//  - 开头的 {{host}}/ 是「服务变量」而非路径参数，抽出来作为 serverVar 并从 path 剥离
 function normalizeUrl(urlStr) {
   let path = urlStr || '/'
   let server = null
+  let serverVar = null
   try {
     const u = new URL(urlStr)
     server = u.origin // 如 https://api.example.com
     path = u.pathname
   } catch {
-    /* 非完整 URL，原样处理 */
+    // 模板 URL（ShowDoc 常见）：{{host}}/v2_api/... 或 {host}/...
+    // 开头的 {{host}} 是「服务变量」，应作为 OpenAPI server variable，而非 path 参数；
+    // 故把开头这段剥离后再走 :param 规范化。
+    const m = path.match(/^\{+([A-Za-z_][A-Za-z0-9_]*)\}+/)
+    if (m) {
+      serverVar = m[1] // 如 'host'
+      path = path.slice(m[0].length) // 去掉 '{{host}}'，保留后面的 '/v2_api/...'
+    }
   }
   path = path.replace(/:([A-Za-z][A-Za-z0-9_]*)/g, '{$1}')
   if (!path) path = '/'
-  return { path, server }
+  return { path, server, serverVar }
 }
 
 function buildParameter(pr, loc) {
@@ -566,19 +575,29 @@ export function toOpenApi(pages, catalog, options) {
   const paths = {}
   const catPaths = buildCatPaths(catalog)
 
-  // 推断 server：仅当所有完整 URL 同源时才提取，避免把多域名混进一个 server
+  // 推断 server：完整 URL 提取 origin；模板 URL（如 {{host}}/...）提取服务变量
   const serverSet = new Set()
+  const serverVarSet = new Set()
   pages.forEach((p) => {
-    const { server } = normalizeUrl(p.url)
+    const { server, serverVar } = normalizeUrl(p.url)
     if (server) serverSet.add(server)
+    if (serverVar) serverVarSet.add(serverVar)
   })
   const inferredServer = serverSet.size === 1 ? [...serverSet][0] : null
-  const servers =
-    opts.servers && opts.servers.length
-      ? opts.servers
-      : inferredServer
-      ? [{ url: inferredServer }]
-      : []
+  let servers = []
+  if (opts.servers && opts.servers.length) {
+    servers = opts.servers
+  } else if (inferredServer) {
+    servers = [{ url: inferredServer }]
+  } else if (serverVarSet.size) {
+    // 模板 URL：把开头的服务变量（如 host）作为 OpenAPI server variable，
+    // 而非当成接口路径参数
+    const variables = {}
+    serverVarSet.forEach((v) => {
+      variables[v] = { default: 'https://example.com', description: `${v} 服务器地址` }
+    })
+    servers = [{ url: `{${[...serverVarSet].join('/')}}`, variables }]
+  }
 
   pages.forEach((p) => {
     const { path } = normalizeUrl(p.url)
