@@ -486,8 +486,10 @@ function toSchema(pr) {
     const ex = pr['x-example'] || pr.example
     if (ex != null && ex !== '') raw = ex
   }
-  const example = raw !== '' && raw != null ? coerceExample(raw, type) : undefined
-  if (example !== undefined) base.example = example
+  // 没有值（或未填写）时，统一给默认空字符串 ""，保证文档中每个字段都有示例占位，
+  // 避免 Swagger UI 等工具里字段缺失 example 而显示为空。
+  const example = raw !== '' && raw != null ? coerceExample(raw, type) : ''
+  base.example = example
   if (type === 'array') {
     // items 的类型优先沿用数组元素类型提示（如 int[] 取 int），否则 string
     const itemType = (pr.type || '').replace(/\[\]$/, '').trim()
@@ -620,7 +622,7 @@ export function toOpenApi(pages, catalog, options) {
       .map((s) => s.replace(/[{}]/g, '').trim())
       .filter(Boolean)
     pathNames.forEach((name) => {
-      parameters.push({ name, in: 'path', required: true, schema: { type: 'string' } })
+      parameters.push({ name, in: 'path', required: true, schema: { type: 'string', example: '' } })
     })
 
     // ── requestBody：按原始类型区分 content-type ──
