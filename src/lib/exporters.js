@@ -35,6 +35,11 @@ function parseRunApi(decoded) {
   const req = obj.request || {}
   const pb = req.params || {}
   const resp = obj.response || {}
+  // RunApi 的「请求体类型(mode)」位置不固定：新版在 request.params.mode，
+  // 旧版在 request.mode；取值通常为 formdata / json / urlencoded / raw 等。
+  // 据此决定导出时走 form-data 还是 JSON，而不是「哪个数组有值就取哪个」的猜测。
+  const rawMode = (pb && pb.mode) || req.mode || ''
+  const mode = String(rawMode).toLowerCase()
   // RunApi 不同版本里 formdata/urlencoded/query/headers 可能是数组，
   // 也可能是对象（{key:{...}}）或字符串/空，这里统一安全转成数组，避免 .filter 崩溃。
   const toArr = (v) => {
@@ -116,6 +121,7 @@ function parseRunApi(decoded) {
     method,
     url,
     title,
+    mode,
     params: reqParams,
     headers,
     bodyForm,
@@ -153,6 +159,7 @@ export function parsePage(page) {
       title: (runapi.title || page.page_title || '').trim(),
       method: runapi.method,
       url: runapi.url,
+      mode: runapi.mode,
       params: runapi.params,
       headers: runapi.headers,
       bodyForm: runapi.bodyForm,
@@ -625,29 +632,45 @@ export function toOpenApi(pages, catalog, options) {
       parameters.push({ name, in: 'path', required: true, schema: { type: 'string', example: '' } })
     })
 
-    // ── requestBody：按原始类型区分 content-type ──
+    // ── requestBody：按 ShowDoc 的 mode 决定 content-type ──
+    // mode 来自 RunApi 的 request.params.mode / request.mode，取值如
+    // formdata / json / urlencoded / raw。优先按 mode 选对应数据，
+    // 避免 ShowDoc 把三个 tab 的数据都存着时「哪个有值取哪个」的误判。
     const form = p.bodyForm || []
     const urlenc = p.bodyUrl || []
     const json = p.bodyJson || []
-    // 优先 json，其次 form-data，再 urlencoded
+    const m = (p.mode || '').toLowerCase()
     let contentType = null
     let src = []
-    if (json.length) {
-      contentType = 'application/json'
-      src = json
-    } else if (form.length) {
+    if (m === 'formdata' || m === 'form-data' || m === 'form') {
       contentType = 'multipart/form-data'
       src = form
-    } else if (urlenc.length) {
+    } else if (m === 'urlencoded' || m === 'x-www-form-urlencoded') {
       contentType = 'application/x-www-form-urlencoded'
       src = urlenc
+    } else if (m === 'json' || m === 'raw') {
+      // raw 通常也是 JSON 体，按 JSON 处理
+      contentType = 'application/json'
+      src = json.length ? json : form.length ? form : urlenc
     }
-    if (!src.length && p.params) {
-      // 兼容普通 Markdown 文档：没有分类 body 时，把 kind==='body' 的当作 JSON
-      const fallback = p.params.filter((x) => x.kind === 'body')
-      if (fallback.length) {
+    if (!src.length) {
+      // mode 未识别或未填时，回退到「哪个数组有值取哪个」（兼容老数据/普通文档）
+      if (json.length) {
         contentType = 'application/json'
-        src = fallback
+        src = json
+      } else if (form.length) {
+        contentType = 'multipart/form-data'
+        src = form
+      } else if (urlenc.length) {
+        contentType = 'application/x-www-form-urlencoded'
+        src = urlenc
+      } else if (p.params) {
+        // 兼容普通 Markdown 文档：没有分类 body 时，把 kind==='body' 的当作 JSON
+        const fallback = p.params.filter((x) => x.kind === 'body')
+        if (fallback.length) {
+          contentType = 'application/json'
+          src = fallback
+        }
       }
     }
     let requestBody
